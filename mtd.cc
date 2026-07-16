@@ -462,6 +462,463 @@ void runtest(const char *testname, int nthreads) {
 }
 
 
+/* ------------------------------------------------------------------ *
+ * memcached text protocol support
+ *
+ * This adds a second listening port on which mtd speaks (most of) the
+ * classic memcached line-based text protocol, translating each command
+ * into the same query<row_type>::run_get1 / run_replace / run_remove
+ * calls used by the native protocol and by mtclient/kvtest_client.
+ *
+ * Design notes / known limitations (documented rather than hidden):
+ *  - Each value is stored in Masstree with a small fixed binary header
+ *    (flags, absolute expiration time, cas id) prepended to the bytes
+ *    the memcached client supplied. That header is stripped again on
+ *    the way out.
+ *  - Expiration is checked lazily on access (no background reaper), so
+ *    an expired key still occupies space until it is next read,
+ *    overwritten, or explicitly deleted.
+ *  - "cas" is implemented as read-compare-write, not as a single
+ *    atomic tree operation, so there is a narrow race between two
+ *    concurrent CAS attempts on the same key. Good enough for
+ *    protocol compatibility / typical usage, not a linearizable CAS.
+ *  - "flush_all" is a stub: memcached's semantics (invalidate every
+ *    key as of now) has no O(1) equivalent over an ordered tree
+ *    without per-key creation timestamps, so it currently just
+ *    returns OK without touching stored data.
+ *  - Connections are handled one thread per connection with blocking
+ *    I/O, not integrated into the tcp/epoll loop used by the native
+ *    protocol. Simpler, and fine for correctness, but each connection
+ *    permanently allocates one threadinfo (consistent with how this
+ *    codebase already treats per-thread threadinfo as long-lived).
+ * ------------------------------------------------------------------ */
+
+static int memcached_port = 0;
+static std::atomic<uint64_t> mc_cas_counter(1);
+
+struct mc_value_header {
+    uint32_t flags;
+    uint64_t exptime; // absolute unix time; 0 = never expires
+    uint64_t cas;
+};
+
+static inline String mc_encode(const mc_value_header& h, Str data) {
+    StringAccum sa;
+    sa.append(reinterpret_cast<const char*>(&h), sizeof(h));
+    sa.append(data.s, data.len);
+    return sa.take_string();
+}
+
+static inline bool mc_decode(Str stored, mc_value_header& h, Str& data) {
+    if (stored.len < (int) sizeof(mc_value_header))
+        return false;
+    memcpy(&h, stored.s, sizeof(h));
+    data = Str(stored.s + sizeof(h), stored.len - sizeof(h));
+    return true;
+}
+
+static inline bool mc_expired(const mc_value_header& h) {
+    return h.exptime != 0 && (uint64_t) time(NULL) >= h.exptime;
+}
+
+// memcached exptime: 0 = never; <=30 days = relative seconds from now;
+// otherwise an absolute unix timestamp. Negative = expire immediately.
+static inline uint64_t mc_normalize_exptime(long exptime) {
+    if (exptime == 0)
+        return 0;
+    if (exptime < 0)
+        return (uint64_t) time(NULL) > 1 ? (uint64_t) time(NULL) - 1 : 0;
+    if (exptime <= 60 * 60 * 24 * 30)
+        return (uint64_t) time(NULL) + (uint64_t) exptime;
+    return (uint64_t) exptime;
+}
+
+// Buffered blocking reader/writer for one memcached client connection.
+struct mc_conn {
+    int fd;
+    enum { bufsz = 64 * 1024 };
+    char* buf;
+    int pos, len;
+
+    mc_conn(int fd_)
+        : fd(fd_), buf(new char[bufsz]), pos(0), len(0) {
+    }
+    ~mc_conn() {
+        delete[] buf;
+    }
+
+    bool fill() {
+        if (pos == len)
+            pos = len = 0;
+        else if (pos > 0) {
+            memmove(buf, buf + pos, len - pos);
+            len -= pos;
+            pos = 0;
+        }
+        if (len == bufsz)
+            return false; // line/token too long for our buffer
+        ssize_t r = read(fd, buf + len, bufsz - len);
+        if (r <= 0)
+            return false;
+        len += (int) r;
+        return true;
+    }
+
+    // Read one CRLF-terminated line (without the CRLF).
+    bool read_line(String& out) {
+        while (true) {
+            for (int i = pos; i + 1 < len; ++i)
+                if (buf[i] == '\r' && buf[i + 1] == '\n') {
+                    out = String(buf + pos, i - pos);
+                    pos = i + 2;
+                    return true;
+                }
+            if (!fill())
+                return false;
+        }
+    }
+
+    // Read exactly n bytes of data plus a trailing CRLF.
+    bool read_data(int n, String& out) {
+        StringAccum sa;
+        int need = n + 2;
+        while (need > 0) {
+            if (pos == len && !fill())
+                return false;
+            int take = std::min(len - pos, need);
+            sa.append(buf + pos, take);
+            pos += take;
+            need -= take;
+        }
+        String s = sa.take_string();
+        if (s.length() < 2
+            || s[s.length() - 2] != '\r' || s[s.length() - 1] != '\n')
+            return false;
+        out = s.substring(s.data(), s.data() + s.length() - 2);
+        return true;
+    }
+
+    bool write_all(const char* s, size_t n) {
+        size_t off = 0;
+        while (off < n) {
+            ssize_t w = write(fd, s + off, n - off);
+            if (w <= 0)
+                return false;
+            off += (size_t) w;
+        }
+        return true;
+    }
+    bool write_str(const String& s) {
+        return write_all(s.data(), s.length());
+    }
+};
+
+static std::vector<String> mc_split(const String& line) {
+    std::vector<String> toks;
+    const char* p = line.data();
+    const char* end = p + line.length();
+    while (p < end) {
+        while (p < end && *p == ' ')
+            ++p;
+        const char* start = p;
+        while (p < end && *p != ' ')
+            ++p;
+        if (p > start)
+            toks.push_back(line.substring(start, p));
+    }
+    return toks;
+}
+
+template <typename T>
+static long mc_parse_long(const String& s, bool& ok) {
+    if (s.empty()) {
+        ok = false;
+        return 0;
+    }
+    char* endp;
+    long v = strtol(s.data(), &endp, 10);
+    ok = (endp == s.data() + s.length());
+    (void) sizeof(T);
+    return v;
+}
+
+// Runs the memcached text protocol over one accepted connection until
+// the client disconnects or sends "quit". Uses its own query<row_type>
+// so it never touches the msgpack-based native protocol's state.
+static void mc_serve(int fd, threadinfo& ti) {
+    mc_conn c(fd);
+    query<row_type> q;
+    String line;
+
+    while (c.read_line(line)) {
+        std::vector<String> t = mc_split(line);
+        if (t.empty())
+            continue;
+        const String& cmd = t[0];
+        bool noreply = !t.empty() && t.back() == "noreply";
+        if (noreply)
+            t.pop_back();
+
+        if (cmd == "set" || cmd == "add" || cmd == "replace"
+            || cmd == "append" || cmd == "prepend" || cmd == "cas") {
+            bool need_cas = (cmd == "cas");
+            size_t minargs = need_cas ? 6u : 5u;
+            if (t.size() < minargs) {
+                c.write_str("ERROR\r\n");
+                continue;
+            }
+            bool ok = true;
+            String key = t[1];
+            long flags = mc_parse_long<uint32_t>(t[2], ok);
+            long exptime = ok ? mc_parse_long<long>(t[3], ok) : 0;
+            long nbytes = ok ? mc_parse_long<int>(t[4], ok) : 0;
+            uint64_t reqcas = 0;
+            if (ok && need_cas) {
+                bool ok2;
+                reqcas = (uint64_t) mc_parse_long<uint64_t>(t[5], ok2);
+                ok = ok && ok2;
+            }
+            if (!ok || nbytes < 0 || key.length() == 0) {
+                c.write_str("ERROR\r\n");
+                continue;
+            }
+            String data;
+            if (!c.read_data((int) nbytes, data))
+                break; // malformed stream; drop connection
+
+            ti.rcu_start();
+            Str oldval;
+            bool found = q.run_get1(tree->table(), key, 0, oldval, ti);
+            mc_value_header oldh;
+            Str olddata;
+            bool have_old = found && mc_decode(oldval, oldh, olddata)
+                             && !mc_expired(oldh);
+
+            const char* resp = "STORED\r\n";
+            bool do_write = true;
+            String newdata = data;
+            if (cmd == "add" && have_old)
+                do_write = false, resp = "NOT_STORED\r\n";
+            else if (cmd == "replace" && !have_old)
+                do_write = false, resp = "NOT_STORED\r\n";
+            else if (cmd == "append" || cmd == "prepend") {
+                if (!have_old) {
+                    do_write = false;
+                    resp = "NOT_STORED\r\n";
+                } else {
+                    StringAccum sa;
+                    if (cmd == "append") {
+                        sa.append(olddata.s, olddata.len);
+                        sa.append(data.data(), data.length());
+                    } else {
+                        sa.append(data.data(), data.length());
+                        sa.append(olddata.s, olddata.len);
+                    }
+                    newdata = sa.take_string();
+                    flags = have_old ? oldh.flags : flags; // preserve flags
+                }
+            } else if (cmd == "cas") {
+                if (!have_old) {
+                    do_write = false;
+                    resp = "NOT_FOUND\r\n";
+                } else if (oldh.cas != reqcas) {
+                    do_write = false;
+                    resp = "EXISTS\r\n";
+                }
+            }
+
+            if (do_write) {
+                mc_value_header h;
+                h.flags = (uint32_t) flags;
+                h.exptime = mc_normalize_exptime(exptime);
+                h.cas = mc_cas_counter.fetch_add(1);
+                String stored = mc_encode(h, Str(newdata.data(), newdata.length()));
+                q.run_replace(tree->table(), key, Str(stored.data(), stored.length()), ti);
+                if (ti.logger())
+                    ti.logger()->record(logcmd_replace, q.query_times(), key,
+                                         Str(stored.data(), stored.length()));
+            }
+            ti.rcu_stop();
+            if (!noreply)
+                c.write_str(resp);
+
+        } else if (cmd == "get" || cmd == "gets") {
+            bool with_cas = (cmd == "gets");
+            ti.rcu_start();
+            for (size_t i = 1; i < t.size(); ++i) {
+                const String& key = t[i];
+                Str val;
+                if (q.run_get1(tree->table(), key, 0, val, ti)) {
+                    mc_value_header h;
+                    Str data;
+                    if (mc_decode(val, h, data) && !mc_expired(h)) {
+                        StringAccum sa;
+                        sa.snprintf(key.length() + 64, "VALUE %.*s %u %d",
+                                    key.length(), key.data(), h.flags, data.len);
+                        if (with_cas)
+                            sa.snprintf(32, " %llu",
+                                        (unsigned long long) h.cas);
+                        sa << "\r\n";
+                        sa.append(data.s, data.len);
+                        sa << "\r\n";
+                        c.write_str(sa.take_string());
+                    }
+                }
+            }
+            ti.rcu_stop();
+            c.write_str("END\r\n");
+
+        } else if (cmd == "delete") {
+            if (t.size() < 2) {
+                c.write_str("ERROR\r\n");
+                continue;
+            }
+            ti.rcu_start();
+            bool removed = q.run_remove(tree->table(), t[1], ti);
+            if (removed && ti.logger())
+                ti.logger()->record(logcmd_remove, q.query_times(), t[1], Str());
+            ti.rcu_stop();
+            if (!noreply)
+                c.write_str(removed ? "DELETED\r\n" : "NOT_FOUND\r\n");
+
+        } else if (cmd == "incr" || cmd == "decr") {
+            if (t.size() < 3) {
+                c.write_str("ERROR\r\n");
+                continue;
+            }
+            bool ok;
+            uint64_t delta = (uint64_t) mc_parse_long<uint64_t>(t[2], ok);
+            if (!ok) {
+                if (!noreply)
+                    c.write_str("CLIENT_ERROR invalid numeric delta argument\r\n");
+                continue;
+            }
+            ti.rcu_start();
+            Str oldval;
+            bool found = q.run_get1(tree->table(), t[1], 0, oldval, ti);
+            mc_value_header h;
+            Str olddata;
+            if (!found || !mc_decode(oldval, h, olddata) || mc_expired(h)) {
+                ti.rcu_stop();
+                if (!noreply)
+                    c.write_str("NOT_FOUND\r\n");
+                continue;
+            }
+            char numbuf[32];
+            int numlen = std::min((int) sizeof(numbuf) - 1, olddata.len);
+            memcpy(numbuf, olddata.s, numlen);
+            numbuf[numlen] = 0;
+            char* endp;
+            unsigned long long cur = strtoull(numbuf, &endp, 10);
+            if (endp == numbuf) {
+                ti.rcu_stop();
+                if (!noreply)
+                    c.write_str("CLIENT_ERROR cannot increment or decrement "
+                                "non-numeric value\r\n");
+                continue;
+            }
+            unsigned long long nv = (cmd == "incr")
+                ? cur + delta
+                : (delta > cur ? 0 : cur - delta);
+            StringAccum sa;
+            sa.snprintf(32, "%llu", nv);
+            String nvs = sa.take_string();
+            h.cas = mc_cas_counter.fetch_add(1);
+            String stored = mc_encode(h, Str(nvs.data(), nvs.length()));
+            q.run_replace(tree->table(), t[1], Str(stored.data(), stored.length()), ti);
+            if (ti.logger())
+                ti.logger()->record(logcmd_replace, q.query_times(), t[1],
+                                     Str(stored.data(), stored.length()));
+            ti.rcu_stop();
+            if (!noreply) {
+                sa.clear();
+                sa << nvs << "\r\n";
+                c.write_str(sa.take_string());
+            }
+
+        } else if (cmd == "flush_all") {
+            // See file-header note: no O(1) whole-tree invalidation, so
+            // this is a protocol-compatible no-op rather than a real flush.
+            if (!noreply)
+                c.write_str("OK\r\n");
+
+        } else if (cmd == "version") {
+            c.write_str("VERSION masstree-mc-1.0\r\n");
+
+        } else if (cmd == "quit") {
+            break;
+
+        } else {
+            if (!noreply)
+                c.write_str("ERROR\r\n");
+        }
+    }
+}
+
+struct mc_threadarg {
+    int fd;
+    int index;
+};
+
+static void* mc_conn_threadfunc(void* x) {
+    mc_threadarg* a = reinterpret_cast<mc_threadarg*>(x);
+    pthread_detach(pthread_self());
+    threadinfo* ti = threadinfo::make(threadinfo::TI_PROCESS, a->index);
+    ti->pthread() = pthread_self();
+    if (logging)
+        ti->set_logger(&logs->log(a->index % nlogger));
+    mc_serve(a->fd, *ti);
+    close(a->fd);
+    delete a;
+    return 0;
+}
+
+// Accepts connections on the memcached port and hands each one to its
+// own thread. Kept separate from the native TCP accept loop so the two
+// protocols can't interfere with each other.
+static void* mc_accept_threadfunc(void*) {
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    always_assert(s >= 0);
+    int yes = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+    struct sockaddr_in sin;
+    bzero(&sin, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_addr.s_addr = INADDR_ANY;
+    sin.sin_port = htons(memcached_port);
+    int ret = bind(s, (struct sockaddr*) &sin, sizeof(sin));
+    if (ret < 0) {
+        perror("memcached-port bind");
+        exit(EXIT_FAILURE);
+    }
+    ret = listen(s, 100);
+    always_assert(ret == 0);
+    printf("memcached protocol listening on port %d\n", memcached_port);
+
+    static int next_index = 1000000; // keep well clear of core-indexed threads
+    while (1) {
+        struct sockaddr_in sin1;
+        socklen_t sinlen = sizeof(sin1);
+        int s1 = accept(s, (struct sockaddr*) &sin1, &sinlen);
+        if (s1 < 0)
+            continue;
+        int yes2 = 1;
+        setsockopt(s1, IPPROTO_TCP, TCP_NODELAY, &yes2, sizeof(yes2));
+        mc_threadarg* a = new mc_threadarg;
+        a->fd = s1;
+        a->index = next_index++;
+        pthread_t t;
+        int r = pthread_create(&t, 0, mc_conn_threadfunc, a);
+        if (r != 0) {
+            close(s1);
+            delete a;
+        }
+    }
+    return 0;
+}
+/* -------------------- end memcached protocol support --------------------- */
+
 struct conn {
     int fd;
     enum { inbufsz = 20 * 1024, inbufrefill = 16 * 1024 };
@@ -562,7 +1019,8 @@ struct conninfo {
 enum { clp_val_suffixdouble = Clp_ValFirstUser };
 enum { opt_nolog = 1, opt_pin, opt_logdir, opt_port, opt_ckpdir, opt_duration,
        opt_test, opt_test_name, opt_threads, opt_cores,
-       opt_print, opt_norun, opt_checkpoint, opt_limit, opt_epoch_interval };
+       opt_print, opt_norun, opt_checkpoint, opt_limit, opt_epoch_interval,
+       opt_memcached_port };
 static const Clp_Option options[] = {
     { "no-log", 0, opt_nolog, 0, 0 },
     { 0, 'n', opt_nolog, 0, 0 },
@@ -576,6 +1034,7 @@ static const Clp_Option options[] = {
     { "ckdir", 0, opt_ckpdir, Clp_ValString, 0 },
     { "cd", 0, opt_ckpdir, Clp_ValString, 0 },
     { "port", 0, opt_port, Clp_ValInt, 0 },
+    { "memcached-port", 0, opt_memcached_port, Clp_ValInt, 0 },
     { "duration", 'd', opt_duration, Clp_ValDouble, 0 },
     { "limit", 'l', opt_limit, clp_val_suffixdouble, 0 },
     { "test", 0, opt_test, Clp_ValString, 0 },
@@ -638,6 +1097,9 @@ main(int argc, char *argv[])
           break;
       case opt_port:
           port = clp->val.i;
+          break;
+      case opt_memcached_port:
+          memcached_port = clp->val.i;
           break;
       case opt_duration:
           duration[0] = clp->val.d;
@@ -813,6 +1275,13 @@ main(int argc, char *argv[])
     always_assert(ret == 0);
     tcpti[i] = ti;
   }
+  // memcached-protocol listener, if requested.
+  if (memcached_port) {
+      pthread_t mc_tid;
+      ret = pthread_create(&mc_tid, 0, mc_accept_threadfunc, 0);
+      always_assert(ret == 0);
+  }
+
   // Create a canceling thread.
   ret = pipe(quit_pipe);
   always_assert(ret == 0);
